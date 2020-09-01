@@ -1,12 +1,13 @@
 GIT
   remote: https://github.com/Roman2K/utils-ruby.git
-  revision: 2fae52e388cf85f06ffc88c25d9b4f12e096f404
+  revision: fa6022c8d6ff2b00bd1fed314b4f6db95d277b2a
   specs:
     utils-ruby (0.1.0)
 
 GEM
   remote: https://rubygems.org/
   specs:
+    bcrypt (3.1.15)
     minitest (5.14.0)
     net_http_unix (0.2.2)
 
@@ -14,6 +15,7 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
+  bcrypt
   minitest
   net_http_unix
   utils-ruby!

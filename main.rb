@@ -2,6 +2,7 @@ require 'net_x/http_unix'
 require 'pp'
 require 'utils'
 require 'base64'
+require 'bcrypt'
 
 class Cmds
   ALIASES_CONF_PATH = "config.dev_aliases.yml"
@@ -18,7 +19,9 @@ class Cmds
     docker = DockerClient.new \
       URI(conf.lookup("docker_uri") || DEFAULT_DOCKER_URI)
 
+    user_defs = conf["users"].to_hash.transform_keys &:to_s
     services = conf["services.static"].to_hash
+
     docker.get_json("/containers/json").each do |props|
       ctn = Container.new props
       next unless ctn.hostmap_enable && !ctn.oneoff
@@ -28,18 +31,34 @@ class Cmds
       svc.length >= 1 or raise "invalid service name: %p" % [svc]
       raise "duplicate service: %p" % [svc] if services.key? svc
       clog.warn "not in caddy network" unless ctn.networks.include? "caddy"
-      services[svc] = "#{svc}:#{port}"
+      services[svc] = {
+        uri: "#{svc}:#{port}",
+        users: ctn.users,
+      }
     end
 
-    routes = services.map do |name, uri|
-      uri = URI "http://#{uri}" unless uri.include? "://"
-      uri = URI uri
-      { match: [
-          {host: conf["domains"].map { |d| "#{name}.#{d}" }},
-        ],
-        handle: [
-          reverse_proxy_handler(uri),
-        ] }
+    routes = services.flat_map do |name, info|
+      info = {uri: info} unless Hash === info
+      users = info.fetch(:users, []).map do |u|
+        passwd = user_defs.fetch(u) { raise "undefined user: #{u}" }
+        [u, passwd]
+      end
+
+      domains = if users.empty?
+        {false => conf["domains"]}
+      else
+        conf["domains"].group_by { _1[:internal] }
+      end
+
+      domains.flat_map do |int, doms|
+        { match: [
+            {host: doms.map { |d| "#{name}.#{d[:domain]}" }},
+          ],
+          handle: [
+            (auth_handler(users) if !int && !users.empty?),
+            reverse_proxy_handler(info.fetch :uri),
+          ].compact }
+      end
     end
 
     if conf["ro"]
@@ -49,8 +68,27 @@ class Cmds
     caddy.set_config "/apps/http/servers/main/routes", routes
   end
 
+  private def auth_handler(users)
+    { handler: "authentication",
+      providers: {
+        http_basic: {
+          hash: {algorithm: "bcrypt"},
+          accounts: users.map { |username, passwd|
+            passwd = Base64.strict_encode64 BCrypt::Password.create(passwd)
+            { username: username,
+              password: passwd }
+          }
+        }
+      } }
+  end
+
   private def reverse_proxy_handler(uri)
-    case uri
+    explicit = true
+    unless uri.include? "://"
+      uri = URI "http://#{uri}" 
+      explicit = false
+    end
+    case uri = URI(uri)
     when URI::HTTPS then https = true
     when URI::HTTP
     else raise "unhandled scheme: #{uri}"
@@ -68,13 +106,12 @@ class Cmds
       },
       headers: {
         request: {
-          set: {
-            "Host" => ["#{uri.host}:#{uri.port}"],
-          }.tap { |h|
+          set: {}.tap do |h|
+            h["Host"] = ["#{uri.host}:#{uri.port}"] if explicit
             h["Authorization"] = [
               "Basic #{Base64.strict_encode64 "#{uri.user}:#{uri.password}"}",
             ] if uri.user
-          }
+          end
         }
       } }
   end
@@ -108,6 +145,7 @@ class Container
       props.fetch("NetworkSettings").fetch("Networks").keys.tap { |arr|
         arr.map! { _1.sub /^#{Regexp.escape project}_/, "" } if project
       }
+    @users = labels["#{LABEL_PREFIX}.users"].to_s.split(",").map &:strip
   end
 
   attr_reader \
@@ -115,7 +153,8 @@ class Container
     :hostmap_enable,
     :service_name,
     :private_port,
-    :networks
+    :networks,
+    :users
 
   private def determine_port(ports, labels)
     labels["#{LABEL_PREFIX}.port"]&.to_i \
