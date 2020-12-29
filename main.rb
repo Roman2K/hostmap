@@ -16,8 +16,9 @@ class Cmds
   def cmd_gen
     conf = @config["caddy"]
     caddy = CaddyClient.new conf["admin_url"], log: @log
-    docker = DockerClient.new \
-      URI(conf.lookup("docker_uri") || DEFAULT_DOCKER_URI)
+    docker = Utils::DockerClient.new \
+      URI(conf.lookup("docker_uri") || DEFAULT_DOCKER_URI),
+      log: @log["docker"]
 
     user_defs = conf["users"].to_hash.transform_keys &:to_s
     services = conf["services.static"].to_hash
@@ -34,11 +35,13 @@ class Cmds
       services[svc] = {
         uri: "#{svc}:#{port}",
         users: ctn.users,
+        force_auth: ctn.force_auth,
       }
     end
 
     routes = services.flat_map do |name, info|
-      info = {uri: info} unless Hash === info
+      info = {uri: info, force_auth: false} unless Hash === info
+
       users = info.fetch(:users, []).map do |u|
         passwd = user_defs.fetch(u) { raise "undefined user: #{u}" }
         [u, passwd]
@@ -51,11 +54,12 @@ class Cmds
       end
 
       domains.flat_map do |int, doms|
+        want_auth = info.fetch(:force_auth) || !int
         { match: [
             {host: doms.map { |d| "#{name}.#{d[:domain]}" }},
           ],
           handle: [
-            (auth_handler(users) if !int && !users.empty?),
+            (auth_handler(users) if !users.empty? && want_auth),
             reverse_proxy_handler(info.fetch :uri),
           ].compact }
       end
@@ -117,28 +121,16 @@ class Cmds
   end
 end
 
-class DockerClient
-  API_VER = "1.40"
-
-  def initialize(uri)
-    uri = NetX::HTTPUnix.new 'unix://' + uri.path if uri.scheme == 'unix'
-    @client = Utils::SimpleHTTP.new uri, json: true
-  end
-
-  def get_json(path)
-    @client.get path
-  end
-end
-
 class Container
   LABEL_PREFIX = "hostmap"
+  DOCKER_TRUE = "True"
 
   def initialize(props)
     labels = props.fetch "Labels"
     project = labels["com.docker.compose.project"]
 
-    @oneoff = labels["com.docker.compose.oneoff"] == "True"
-    @hostmap_enable = labels["#{LABEL_PREFIX}.enable"] == "True"
+    @oneoff = labels["com.docker.compose.oneoff"] == DOCKER_TRUE
+    @hostmap_enable = labels["#{LABEL_PREFIX}.enable"] == DOCKER_TRUE
     @service_name = labels["com.docker.compose.service"]
     @private_port = determine_port(props.fetch("Ports"), labels)
     @networks =
@@ -146,6 +138,7 @@ class Container
         arr.map! { _1.sub /^#{Regexp.escape project}_/, "" } if project
       }
     @users = labels["#{LABEL_PREFIX}.users"].to_s.split(",").map &:strip
+    @force_auth = labels["#{LABEL_PREFIX}.force_auth"] == DOCKER_TRUE
   end
 
   attr_reader \
@@ -154,7 +147,8 @@ class Container
     :service_name,
     :private_port,
     :networks,
-    :users
+    :users,
+    :force_auth
 
   private def determine_port(ports, labels)
     labels["#{LABEL_PREFIX}.port"]&.to_i \
