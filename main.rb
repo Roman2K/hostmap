@@ -23,21 +23,15 @@ class Cmds
     user_defs = conf["users"].to_hash.transform_keys &:to_s
     services = conf["services.static"].to_hash
 
-    docker.get_json("/containers/json").each do |props|
-      ctn = Container.new props
-      next unless ctn.hostmap_enable && !ctn.oneoff
-      port = ctn.private_port or next
-      svc = ctn.service_name or next
-      clog = @log[svc: svc]
-      svc.length >= 1 or raise "invalid service name: %p" % [svc]
-      raise "duplicate service: %p" % [svc] if services.key? svc
-      clog.warn "not in caddy network" unless ctn.networks.include? "caddy"
-      services[svc] = {
-        uri: "#{svc}:#{port}",
-        users: ctn.users,
-        force_auth: ctn.force_auth,
+    docker.get_json("/containers/json").
+      flat_map { |props| Container.new(props, log: @log).hostmaps }.
+      each { |hm|
+        services[hm.domain] = {
+          uri: "#{hm.service}:#{hm.port}",
+          users: hm.users,
+          force_auth: hm.force_auth,
+        }
       }
-    end
 
     routes = services.flat_map do |name, info|
       info = {uri: info, force_auth: false} unless Hash === info
@@ -122,37 +116,69 @@ class Cmds
 end
 
 class Container
-  LABEL_PREFIX = "hostmap"
+  HOSTMAP_PREFIX = "hostmap"
   DOCKER_TRUE = "True"
 
-  def initialize(props)
+  def initialize(props, log:)
     labels = props.fetch "Labels"
+    ports = props.fetch "Ports"
+    oneoff = labels["com.docker.compose.oneoff"] == DOCKER_TRUE
     project = labels["com.docker.compose.project"]
 
-    @oneoff = labels["com.docker.compose.oneoff"] == DOCKER_TRUE
-    @hostmap_enable = labels["#{LABEL_PREFIX}.enable"] == DOCKER_TRUE
     @service_name = labels["com.docker.compose.service"]
-    @private_port = determine_port(props.fetch("Ports"), labels)
+    @log = log[service: @service_name]
+
     @networks =
-      props.fetch("NetworkSettings").fetch("Networks").keys.tap { |arr|
+      props.fetch("NetworkSettings").fetch("Networks").keys.tap do |arr|
         arr.map! { _1.sub /^#{Regexp.escape project}_/, "" } if project
-      }
-    @users = labels["#{LABEL_PREFIX}.users"].to_s.split(",").map &:strip
-    @force_auth = labels["#{LABEL_PREFIX}.force_auth"] == DOCKER_TRUE
+      end
+    @hostmaps = [].tap do
+      _1.concat build_hostmaps(labels, ports) unless oneoff
+    end
   end
 
-  attr_reader \
-    :oneoff,
-    :hostmap_enable,
-    :service_name,
-    :private_port,
-    :networks,
-    :users,
-    :force_auth
+  attr_reader :hostmaps
 
-  private def determine_port(ports, labels)
-    labels["#{LABEL_PREFIX}.port"]&.to_i \
-      || ports.find { |p| p.fetch("Type") == "tcp" }&.fetch("PrivatePort")
+  private def build_hostmaps(labels, ports)
+    labels = self.class.nested_labels(labels).fetch(HOSTMAP_PREFIX, {})
+    defs = labels.delete("as") || {}
+    defs[@service_name] ||= labels if !labels.empty?
+
+    defs.filter_map do |domain, props|
+      if val = props.delete("enable") and val != DOCKER_TRUE
+        next
+      end
+      port = props.delete("port")&.to_i \
+        || ports.find { |p| p.fetch("Type") == "tcp" }&.fetch("PrivatePort") \
+        or next
+      users = props.delete("users").to_s.split(",").map &:strip
+      force_auth = props.delete("force_auth") == DOCKER_TRUE
+      dlog = @log[domain: domain]
+      dlog.warn "not in caddy network" unless @networks.include? "caddy"
+      props.empty? or raise "extra hostmap properties: #{props.keys.join ", "}"
+
+      Hostmap.new \
+        service: @service_name,
+        domain: domain,
+        port: port,
+        users: users,
+        force_auth: force_auth
+    end
+  end
+
+  Hostmap = Struct.new :service, :domain, :port, :users, :force_auth,
+    keyword_init: true
+
+  def self.nested_labels(labels)
+    hash = {}
+    labels.each do |key, val|
+      *hier, last_k = key.split "."
+      dest = hier.inject(hash) do |h,k|
+        h.delete(k) unless Hash === h[k]; h[k] ||= {}
+      end
+      dest[last_k] = val
+    end
+    hash
   end
 end
 
