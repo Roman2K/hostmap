@@ -33,7 +33,8 @@ class Cmds
         }
       }
 
-    routes = services.flat_map do |name, info|
+    routes = conf.lookup("routes").map &:to_hash
+    services.each do |name, info|
       info = {uri: info, force_auth: false} unless Hash === info
 
       users = info.fetch(:users, []).map do |u|
@@ -47,20 +48,22 @@ class Cmds
         conf["domains"].group_by { _1[:internal] }
       end
 
-      domains.flat_map do |int, doms|
-        want_auth = info.fetch(:force_auth) || !int
-        { match: [
+      domains.each do |is_int, doms|
+        want_auth = info.fetch(:force_auth) || !is_int
+        routes << {
+          match: [
             {host: doms.map { |d| "#{name}.#{d[:domain]}" }},
           ],
           handle: [
             (auth_handler(users) if !users.empty? && want_auth),
             reverse_proxy_handler(info.fetch :uri),
-          ].compact }
+          ].compact
+        }
       end
     end
 
     if conf["ro"]
-      pp routes: routes
+      JSON.dump routes, $stdout
       return
     end
     caddy.set_config "/apps/http/servers/main/routes", routes
